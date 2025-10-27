@@ -1,251 +1,312 @@
-﻿Function Get-Privilege {
-    <#
-        .SYNOPSIS
-            Gets all privileges on a local or remote system.
+﻿<# ===================== Get-Privilege.ps1 ===================== #>
 
-        .DESCRIPTION
-            Gets the currently applied privileges or current user privileges.
-        
-        .PARAMETER Privilege            
-            Specific privilege/s to view.
+# Helper: check if a type is already loaded
+function Test-TypeLoaded {
+  param([Parameter(Mandatory)][string]$TypeName)
+  return [bool]($TypeName -as [type])
+}
 
-        .PARAMETER Computername
-            View privileges on a remote system
+# Add types once, under a unique namespace to avoid collisions
+if (-not (Test-TypeLoaded 'PPriv2.Native')) {
+  Add-Type @"
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
 
-        .PARAMETER CurrentUser
-            View the currently applied privileges for the current user
-        
-        .NOTES
-            Name: Get-Privilege
-            Author: Boe Prox
-            Version History:
-                1.0 - Initial Version
+namespace PPriv2 {
+  [StructLayout(LayoutKind.Sequential)]
+  public struct LUID { public UInt32 LowPart; public Int32 HighPart; }
 
-        .EXAMPLE
-            Get-Privilege
+  [StructLayout(LayoutKind.Sequential)]
+  public struct LUID_AND_ATTRIBUTES { public LUID Luid; public UInt32 Attributes; }
 
-            Computername         Privilege                        Accounts
-            ------------         ---------                        --------
-            BOE-PC               SeAssignPrimaryTokenPrivilege    {IIS APPPOOL\.NET v4.5 Cl...
-            BOE-PC               SeAuditPrivilege                 {IIS APPPOOL\.NET v4.5 Cl...
-            BOE-PC               SeBackupPrivilege                {BUILTIN\Backup Operators...
-            BOE-PC               SeBatchLogonRight                {BUILTIN\IIS_IUSRS, BUILT...
-            BOE-PC               SeChangeNotifyPrivilege          {Window Manager\Window Ma...
-            BOE-PC               SeCreateGlobalPrivilege          {NT AUTHORITY\SERVICE, BU...
-            BOE-PC               SeCreatePagefilePrivilege        {BUILTIN\Administrators}
-            BOE-PC               SeCreatePermanentPrivilege       {}
-            BOE-PC               SeCreateSymbolicLinkPrivilege    {BUILTIN\Administrators}
-            ...
+  public static class Native {
+    public const int TokenPrivileges = 3;
 
-            Description
-            -----------
-            Enables the SeBackupPrivilege on the existing process
+    [DllImport("advapi32.dll", SetLastError=true)]
+    public static extern bool OpenProcessToken(IntPtr ProcessHandle, UInt32 DesiredAccess, out IntPtr TokenHandle);
 
-        .EXAMPLE
-            Get-Privilege -CurrentUser
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetCurrentProcess();
 
-            Privilege                        Description                              Enabled
-            ---------                        -----------                              -------
-            SeLockMemoryPrivilege            Lock pages in memory                     False
-            SeIncreaseQuotaPrivilege         Adjust memory quotas for a process       False
-            SeTcbPrivilege                   Act as part of the operating system      False
-            SeSecurityPrivilege              Manage auditing and security log         False
-            SeTakeOwnershipPrivilege         Take ownership of files or other objects False
-            SeLoadDriverPrivilege            Load and unload device drivers           False
-            SeSystemProfilePrivilege         Profile system performance               False
-            SeSystemtimePrivilege            Change the system time                   False
-            SeProfileSingleProcessPrivilege  Profile single process                   False
-            SeIncreaseBasePriorityPrivilege  Increase scheduling priority             False
-            SeCreatePagefilePrivilege        Create a pagefile                        False
-            SeBackupPrivilege                Back up files and directories            False
-            SeRestorePrivilege               Restore files and directories            False
-            SeShutdownPrivilege              Shut down the system                     False
-            SeDebugPrivilege                 Debug programs                           True
-            SeSystemEnvironmentPrivilege     Modify firmware environment values       False
-            SeChangeNotifyPrivilege          Bypass traverse checking                 True
-            SeRemoteShutdownPrivilege        Force shutdown from a remote system      False
-            SeUndockPrivilege                Remove computer from docking station     False
-            SeManageVolumePrivilege          Perform volume maintenance tasks         False
-            SeImpersonatePrivilege           Impersonate a client after authentica... True
-            SeCreateGlobalPrivilege          Create global objects                    True
-            SeIncreaseWorkingSetPrivilege    Increase a process working set           False
-            SeTimeZonePrivilege              Change the time zone                     False
-            SeCreateSymbolicLinkPrivilege    Create symbolic links                    False
+    [DllImport("advapi32.dll", SetLastError=true)]
+    public static extern bool GetTokenInformation(
+        IntPtr TokenHandle,
+        int TokenInformationClass,
+        IntPtr TokenInformation,
+        int TokenInformationLength,
+        out int ReturnLength);
 
-            Description
-            -----------
-            Displays currently applied privileges for current user.
+    [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+    public static extern bool LookupPrivilegeName(
+        string lpSystemName,
+        IntPtr lpLuid,
+        StringBuilder lpName,
+        ref int cchName);
 
-        .EXAMPLE
-            Get-Privilege -Privilege SeDebugPrivilege
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool CloseHandle(IntPtr hObject);
+  }
 
-            Computername         Privilege                        Accounts
-            ------------         ---------                        --------
-            BOE-PC               SeDebugPrivilege                 {}
+  public enum Privileges {
+    SeAssignPrimaryTokenPrivilege=1, SeAuditPrivilege, SeBackupPrivilege, SeChangeNotifyPrivilege,
+    SeCreateGlobalPrivilege, SeCreatePagefilePrivilege, SeCreatePermanentPrivilege,
+    SeCreateSymbolicLinkPrivilege, SeCreateTokenPrivilege, SeDebugPrivilege,
+    SeEnableDelegationPrivilege, SeImpersonatePrivilege, SeIncreaseBasePriorityPrivilege,
+    SeIncreaseQuotaPrivilege, SeIncreaseWorkingSetPrivilege, SeLoadDriverPrivilege,
+    SeLockMemoryPrivilege, SeMachineAccountPrivilege, SeManageVolumePrivilege,
+    SeProfileSingleProcessPrivilege, SeRelabelPrivilege, SeRemoteShutdownPrivilege,
+    SeRestorePrivilege, SeSecurityPrivilege, SeShutdownPrivilege, SeSyncAgentPrivilege,
+    SeSystemEnvironmentPrivilege, SeSystemProfilePrivilege, SeSystemtimePrivilege,
+    SeTakeOwnershipPrivilege, SeTcbPrivilege, SeTimeZonePrivilege,
+    SeTrustedCredManAccessPrivilege, SeUndockPrivilege
+  }
+}
+"@
+}
 
-        Description
-        -----------
-        Shows all accounts/groups that have been given SeDebugPrivilege
+function Invoke-PPriv2LocalEnum {
+  # Enumerate privileges of the current process token
+  $TOKEN_QUERY = 0x0008
+  $SE_PRIVILEGE_ENABLED            = 0x00000002
+  $SE_PRIVILEGE_ENABLED_BY_DEFAULT = 0x00000001
+  $SE_PRIVILEGE_USED_FOR_ACCESS    = 0x80000000
 
-        .OutputType
-            PSPrivilege.Privilege
-            PSPrivilege.CurrentUserPrivilege
-    #>
-    #REQUIRES -Version 3.0
-    [OutputType('PSPrivilege.Privilege','PSPrivilege.CurrentUserPrivilege')]
-    [cmdletbinding(
-        DefaultParameterSetName = 'Default'
-    )]
-    Param (
-        [parameter(ParameterSetName='Default')]
-        [Privileges[]]$Privilege,
-        [parameter(ParameterSetName='Default')]
-        [string]$Computername = $Env:Computername  ,
-        [parameter(ParameterSetName='CurrentUser')]
-        [switch]$CurrentUser
-    )
-    Switch ($PSCmdlet.ParameterSetName) {
-        'CurrentUser' {
-            $Process = Get-Process -Id $PID
-            $PROCESS_QUERY_INFORMATION = [ProcessAccessFlags]::QueryInformation
+  $hToken = [IntPtr]::Zero
+  if (-not [PPriv2.Native]::OpenProcessToken([PPriv2.Native]::GetCurrentProcess(), $TOKEN_QUERY, [ref]$hToken)) {
+    throw "OpenProcessToken failed: $([ComponentModel.Win32Exception]::new([Runtime.InteropServices.Marshal]::GetLastWin32Error()).Message)"
+  }
 
-            $TOKEN_ALL_ACCESS = [System.Security.Principal.TokenAccessLevels]::AllAccess
-            $hProcess = [PoShPrivilege]::OpenProcess(
-                $PROCESS_QUERY_INFORMATION, 
-                $True, 
-                $Process.Id
-            )
-            Write-Debug "ProcessHandle: $($hProcess)"
+  try {
+    $outLen = 0
+    [void][PPriv2.Native]::GetTokenInformation($hToken, [PPriv2.Native]::TokenPrivileges, [IntPtr]::Zero, 0, [ref]$outLen)
+    if ($outLen -le 0) { return @() }
 
-            $hProcessToken = [intptr]::Zero
-            [void][PoShPrivilege]::OpenProcessToken(
-                $hProcess, 
-                $TOKEN_ALL_ACCESS, 
-                [ref]$hProcessToken
-            )
-            Write-Debug "ProcessToken: $($hProcessToken)"
-            [void][PoShPrivilege]::CloseHandle($hProcess)
+    $buf = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($outLen)
+    try {
+      if (-not [PPriv2.Native]::GetTokenInformation($hToken, [PPriv2.Native]::TokenPrivileges, $buf, $outLen, [ref]$outLen)) {
+        throw "GetTokenInformation failed: $([ComponentModel.Win32Exception]::new([Runtime.InteropServices.Marshal]::GetLastWin32Error()).Message)"
+      }
 
-            [UInt32]$TokenPrivSize = 1000
-            [IntPtr]$TokenPrivPtr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($TokenPrivSize)
-            [uint32]$ReturnLength = 0
-            [void][PoShPrivilege]::GetTokenInformation(
-                $hProcessToken,
-                [TOKEN_INFORMATION_CLASS]::TokenPrivileges,
-                $TokenPrivPtr,
-                $TokenPrivSize,
-                [ref]$ReturnLength
-            )
+      $count = [System.Runtime.InteropServices.Marshal]::ReadInt32($buf)
+      $ptr   = [IntPtr]::Add($buf, 4)
+      $laSz  = [System.Runtime.InteropServices.Marshal]::SizeOf([type]'PPriv2.LUID_AND_ATTRIBUTES')
 
-            $TokenPrivileges = [System.Runtime.InteropServices.Marshal]::PtrToStructure($TokenPrivPtr, [Type][TOKEN_PRIVILEGES])
-            [IntPtr]$PrivilegesBasePtr = [IntPtr](AddSignedIntAsUnsigned $TokenPrivPtr ([System.Runtime.InteropServices.Marshal]::OffsetOf(
-                [Type][TOKEN_PRIVILEGES], "Privileges"
-            )))
-            $LuidAndAttributeSize = [System.Runtime.InteropServices.Marshal]::SizeOf([Type][LUID_AND_ATTRIBUTES])
-            for ($i=0; $i -lt $TokenPrivileges.PrivilegeCount; $i++) {
-                $LuidAndAttributePtr = [IntPtr](AddSignedIntAsUnsigned $PrivilegesBasePtr ($LuidAndAttributeSize * $i))
-                $LuidAndAttribute = [System.Runtime.InteropServices.Marshal]::PtrToStructure($LuidAndAttributePtr, [Type][LUID_AND_ATTRIBUTES])
-                [UInt32]$PrivilegeNameSize = 60
-                $PrivilegeNamePtr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($PrivilegeNameSize)
-                $PLuid = $LuidAndAttributePtr
-                [void][PoShPrivilege]::LookupPrivilegeNameW(
-                    [IntPtr]::Zero, 
-                    $PLuid, 
-                    $PrivilegeNamePtr, 
-                    [Ref]$PrivilegeNameSize
-                )
-                $PrivilegeName = [System.Runtime.InteropServices.Marshal]::PtrToStringUni($PrivilegeNamePtr)
-                $Enabled = $False
-                If ($LuidAndAttribute.Attributes -ne 0) {
-                    $Enabled = $True
-                }
-                $Object = [pscustomobject]@{
-                    Computername = $env:COMPUTERNAME
-                    Account = "{0}\{1}" -f ($env:USERDOMAIN, $env:USERNAME)
-                    Privilege = $PrivilegeName
-                    Description = GetPrivilegeDisplayName -Privilege $PrivilegeName
-                    Enabled = $Enabled
-                }
-                $Object.pstypenames.insert(0,'PSPrivilege.CurrentUserPrivilege')
-                $Object
-            }
+      $items = New-Object System.Collections.Generic.List[object]
+
+      for ($i=0; $i -lt $count; $i++) {
+        $la = [System.Runtime.InteropServices.Marshal]::PtrToStructure($ptr, [type]'PPriv2.LUID_AND_ATTRIBUTES')
+        $ptr = [IntPtr]::Add($ptr, $laSz)
+
+        # Marshal LUID for LookupPrivilegeName
+        $luidPtr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal([System.Runtime.InteropServices.Marshal]::SizeOf([type]'PPriv2.LUID'))
+        try {
+          [System.Runtime.InteropServices.Marshal]::StructureToPtr($la.Luid, $luidPtr, $false)
+          $sb  = New-Object System.Text.StringBuilder 256
+          $len = $sb.Capacity
+          $ok  = [PPriv2.Native]::LookupPrivilegeName($null, $luidPtr, $sb, [ref]$len)
+          $name = if ($ok) { $sb.ToString() } else { "<Unknown>" }
         }
-        Default {
-            If (-NOT $PSBoundParameters.ContainsKey('Privilege')) {
-                $Privilege = [Privileges].GetEnumNames()
-            }
-
-            #region LsaOpenPolicy
-            $Computer = New-Object LSA_UNICODE_STRING
-            $Computer.Buffer = $Computername
-            $Computer.Length = ($Computer.buffer.length * [System.Text.UnicodeEncoding]::CharSize)
-            $Computer.MaximumLength = (($Computer.buffer.length+1) * [System.Text.UnicodeEncoding]::CharSize)
-            $PolicyHandle = [intptr]::Zero
-            $ObjectAttributes = New-Object LSA_OBJECT_ATTRIBUTES
-            [uint32]$Access = [LSA_AccessPolicy]::POLICY_VIEW_LOCAL_INFORMATION -BOR [LSA_AccessPolicy]::POLICY_LOOKUP_NAMES
-            Write-Verbose "Opening policy handle"
-            [void][PoShPrivilege]::LsaOpenPolicy(
-                [ref]$Computer,
-                [ref]$ObjectAttributes,
-                $Access,
-                [ref]$PolicyHandle
-            )
-            #endregion LsaOpenPolicy
-
-            #region LsaEnumerateAccountsWithUserRight
-            ForEach ($Priv in $Privilege) {
-                $UserRight = New-Object LSA_UNICODE_STRING
-                $UserRight.Buffer = $Priv.ToString()
-                $UserRight.Length = ($UserRight.Buffer.Length * [System.Text.UnicodeEncoding]::CharSize)
-                $UserRight.MaximumLength = (($UserRight.buffer.length+1) * [System.Text.UnicodeEncoding]::CharSize)
-                $EnumerationBuffer = [intptr]::Zero
-                [uint32]$Count = 0 
-                Write-Verbose "Gathering enumerating accounts with user right"               
-                $NTStatus = [PoShPrivilege]::LsaEnumerateAccountsWithUserRight(
-                    $PolicyHandle,
-                    $UserRight,
-                    [ref]$EnumerationBuffer,
-                    [ref]$Count
-                )
-                $Accounts = New-Object System.Collections.Arraylist
-                If ($NTStatus -eq 0) {
-                    $LSAInfo = [intptr]::Zero
-                    $StructSize = [System.Runtime.InteropServices.Marshal]::SizeOf([type][LSA_ENUMERATION_INFORMATION])    
-                    Write-Debug "StructSize: $($StructSize)"
-                    Write-Verbose "Gathering privilege information"
-                    For ($i=0; $i -lt $Count; $i++) {
-                        Write-Debug "Iteration: $($i)"
-                        $EnumerationItem = [intptr]($EnumerationBuffer.ToInt64() + ([long]$StructSize*[long]$i))
-                        $Sid = [System.Runtime.InteropServices.Marshal]::PtrToStructure(
-                            $EnumerationItem,
-                            [type][LSA_ENUMERATION_INFORMATION]
-                        )
-                        [string]$SIDString = [string]::Empty
-                        [void][PoShPrivilege]::ConvertSidToStringSid($Sid.sid, [ref]$SIDString)
-                        Try {
-                            $Account = ([system.security.principal.securityidentifier]$SIDString).Translate([System.Security.Principal.NTAccount]).Value
-                        } Catch {
-                            $Account = $SIDString
-                        }
-                        [void]$Accounts.Add($Account)
-                    }
-                }  
-                $Object = [pscustomobject]@{
-                    Computername = $Computername
-                    Privilege = $Priv.ToString()
-                    Description = GetPrivilegeDisplayName -Privilege $Priv.ToString()
-                    Accounts = $Accounts
-                }
-                $Object.pstypenames.insert(0,'PSPrivilege.Privilege')
-                $Object
-            }
-            #endregion LsaEnumerateAccountsWithUserRight
-
-            #region Close Policy Handle
-            Write-Verbose "Closing policy handle"
-            [void][PoShPrivilege]::LsaClose($PolicyHandle)
-            $PolicyHandle = [intptr]::Zero
-            #region Close Policy Handle
+        finally {
+          [System.Runtime.InteropServices.Marshal]::FreeHGlobal($luidPtr)
         }
+
+        $attr = $la.Attributes
+        $items.Add([pscustomobject]@{
+          Name             = $name
+          Enabled          = ($attr -band $SE_PRIVILEGE_ENABLED) -ne 0
+          EnabledByDefault = ($attr -band $SE_PRIVILEGE_ENABLED_BY_DEFAULT) -ne 0
+          UsedForAccess    = ($attr -band $SE_PRIVILEGE_USED_FOR_ACCESS) -ne 0
+          Attributes       = ('0x{0:X8}' -f $attr)
+        })
+      }
+
+      return $items
     }
+    finally {
+      [System.Runtime.InteropServices.Marshal]::FreeHGlobal($buf)
+    }
+  }
+  finally {
+    [PPriv2.Native]::CloseHandle($hToken) | Out-Null
+  }
+}
+
+function Get-Privilege {
+<#
+.SYNOPSIS
+  Enumerates privileges of a process token and optionally filters them.
+
+.PARAMETER Privilege
+  One or more privilege names (as [PPriv2.Privileges]) to filter the output. Optional.
+
+.PARAMETER ComputerName
+  Target computer (Default set). Defaults to current computer name. Uses WinRM for remote.
+
+.PARAMETER CurrentUser
+  Uses the calling session's token on the local machine. Ignores -ComputerName.
+
+.EXAMPLE
+  Get-Privilege
+
+.EXAMPLE
+  Get-Privilege -Privilege SeBackupPrivilege, SeRestorePrivilege
+
+.EXAMPLE
+  Get-Privilege -ComputerName SERVER01
+
+.EXAMPLE
+  Get-Privilege -CurrentUser
+#>
+  [CmdletBinding(DefaultParameterSetName='Default')]
+  param(
+    [parameter(ParameterSetName='Default')]
+    [PPriv2.Privileges[]]$Privilege,
+
+    [parameter(ParameterSetName='Default')]
+    [string]$ComputerName = $Env:ComputerName,
+
+    [parameter(ParameterSetName='CurrentUser')]
+    [switch]$CurrentUser
+  )
+
+  if ($PSCmdlet.ParameterSetName -eq 'CurrentUser') {
+    $result = Invoke-PPriv2LocalEnum
+  }
+  else {
+    $isLocal =
+      [string]::IsNullOrWhiteSpace($ComputerName) -or
+      ($ComputerName -eq '.') -or
+      ($ComputerName -eq 'localhost') -or
+      ($ComputerName -ieq $env:COMPUTERNAME)
+
+    if ($isLocal) {
+      $result = Invoke-PPriv2LocalEnum
+    }
+    else {
+      $remoteBlock = {
+        if (-not ([bool]('PPriv2.Native' -as [type]))) {
+          Add-Type @"
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+
+namespace PPriv2 {
+  [StructLayout(LayoutKind.Sequential)]
+  public struct LUID { public UInt32 LowPart; public Int32 HighPart; }
+  [StructLayout(LayoutKind.Sequential)]
+  public struct LUID_AND_ATTRIBUTES { public LUID Luid; public UInt32 Attributes; }
+  public static class Native {
+    public const int TokenPrivileges = 3;
+    [DllImport("advapi32.dll", SetLastError=true)]
+    public static extern bool OpenProcessToken(IntPtr ProcessHandle, UInt32 DesiredAccess, out IntPtr TokenHandle);
+    [DllImport("kernel32.dll")] public static extern IntPtr GetCurrentProcess();
+    [DllImport("advapi32.dll", SetLastError=true)]
+    public static extern bool GetTokenInformation(IntPtr TokenHandle, int TokenInformationClass, IntPtr TokenInformation, int TokenInformationLength, out int ReturnLength);
+    [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+    public static extern bool LookupPrivilegeName(string lpSystemName, IntPtr lpLuid, StringBuilder lpName, ref int cchName);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool CloseHandle(IntPtr hObject);
+  }
+  public enum Privileges {
+    SeAssignPrimaryTokenPrivilege=1, SeAuditPrivilege, SeBackupPrivilege, SeChangeNotifyPrivilege,
+    SeCreateGlobalPrivilege, SeCreatePagefilePrivilege, SeCreatePermanentPrivilege,
+    SeCreateSymbolicLinkPrivilege, SeCreateTokenPrivilege, SeDebugPrivilege,
+    SeEnableDelegationPrivilege, SeImpersonatePrivilege, SeIncreaseBasePriorityPrivilege,
+    SeIncreaseQuotaPrivilege, SeIncreaseWorkingSetPrivilege, SeLoadDriverPrivilege,
+    SeLockMemoryPrivilege, SeMachineAccountPrivilege, SeManageVolumePrivilege,
+    SeProfileSingleProcessPrivilege, SeRelabelPrivilege, SeRemoteShutdownPrivilege,
+    SeRestorePrivilege, SeSecurityPrivilege, SeShutdownPrivilege, SeSyncAgentPrivilege,
+    SeSystemEnvironmentPrivilege, SeSystemProfilePrivilege, SeSystemtimePrivilege,
+    SeTakeOwnershipPrivilege, SeTcbPrivilege, SeTimeZonePrivilege,
+    SeTrustedCredManAccessPrivilege, SeUndockPrivilege
+  }
+}
+"@
+        }
+
+        function Invoke-PPriv2LocalEnum {
+          $TOKEN_QUERY = 0x0008
+          $SE_PRIVILEGE_ENABLED            = 0x00000002
+          $SE_PRIVILEGE_ENABLED_BY_DEFAULT = 0x00000001
+          $SE_PRIVILEGE_USED_FOR_ACCESS    = 0x80000000
+
+          $hToken = [IntPtr]::Zero
+          if (-not [PPriv2.Native]::OpenProcessToken([PPriv2.Native]::GetCurrentProcess(), $TOKEN_QUERY, [ref]$hToken)) {
+            throw "OpenProcessToken failed: $([ComponentModel.Win32Exception]::new([Runtime.InteropServices.Marshal]::GetLastWin32Error()).Message)"
+          }
+
+          try {
+            $outLen = 0
+            [void][PPriv2.Native]::GetTokenInformation($hToken, [PPriv2.Native]::TokenPrivileges, [IntPtr]::Zero, 0, [ref]$outLen)
+            if ($outLen -le 0) { return @() }
+
+            $buf = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($outLen)
+            try {
+              if (-not [PPriv2.Native]::GetTokenInformation($hToken, [PPriv2.Native]::TokenPrivileges, $buf, $outLen, [ref]$outLen)) {
+                throw "GetTokenInformation failed: $([ComponentModel.Win32Exception]::new([Runtime.InteropServices.Marshal]::GetLastWin32Error()).Message)"
+              }
+
+              $count = [System.Runtime.InteropServices.Marshal]::ReadInt32($buf)
+              $ptr   = [IntPtr]::Add($buf, 4)
+              $laSz  = [System.Runtime.InteropServices.Marshal]::SizeOf([type]'PPriv2.LUID_AND_ATTRIBUTES')
+
+              $items = New-Object System.Collections.Generic.List[object]
+
+              for ($i=0; $i -lt $count; $i++) {
+                $la = [System.Runtime.InteropServices.Marshal]::PtrToStructure($ptr, [type]'PPriv2.LUID_AND_ATTRIBUTES')
+                $ptr = [IntPtr]::Add($ptr, $laSz)
+
+                $luidPtr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal([System.Runtime.InteropServices.Marshal]::SizeOf([type]'PPriv2.LUID'))
+                try {
+                  [System.Runtime.InteropServices.Marshal]::StructureToPtr($la.Luid, $luidPtr, $false)
+                  $sb  = New-Object System.Text.StringBuilder 256
+                  $len = $sb.Capacity
+                  $ok  = [PPriv2.Native]::LookupPrivilegeName($null, $luidPtr, $sb, [ref]$len)
+                  $name = if ($ok) { $sb.ToString() } else { "<Unknown>" }
+                }
+                finally {
+                  [System.Runtime.InteropServices.Marshal]::FreeHGlobal($luidPtr)
+                }
+
+                $attr = $la.Attributes
+                $items.Add([pscustomobject]@{
+                  Name             = $name
+                  Enabled          = ($attr -band 0x00000002) -ne 0
+                  EnabledByDefault = ($attr -band 0x00000001) -ne 0
+                  UsedForAccess    = ($attr -band 0x80000000) -ne 0
+                  Attributes       = ('0x{0:X8}' -f $attr)
+                })
+              }
+
+              return $items
+            }
+            finally {
+              [System.Runtime.InteropServices.Marshal]::FreeHGlobal($buf)
+            }
+          }
+          finally {
+            [PPriv2.Native]::CloseHandle($hToken) | Out-Null
+          }
+        }
+
+        Invoke-PPriv2LocalEnum
+      }
+
+      try {
+        $result = Invoke-Command -ComputerName $ComputerName -ScriptBlock $remoteBlock
+      }
+      catch {
+        throw "Remote enumeration failed on '$ComputerName': $($_.Exception.Message)"
+      }
+    }
+  }
+
+  # Filter by -Privilege if provided
+  if ($PSBoundParameters.ContainsKey('Privilege') -and $Privilege) {
+    $names = $Privilege | ForEach-Object { $_.ToString() }
+    $result = $result | Where-Object { $_.Name -in $names }
+  }
+
+  $result
 }
